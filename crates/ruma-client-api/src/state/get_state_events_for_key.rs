@@ -14,6 +14,7 @@ pub mod v3 {
         OwnedRoomId,
     };
     use ruma_events::{AnyStateEventContent, StateEventType};
+    use serde::Deserialize;
 
     const METADATA: Metadata = metadata! {
         method: GET,
@@ -24,6 +25,14 @@ pub mod v3 {
             1.1 => "/_matrix/client/v3/rooms/:room_id/state/:event_type/:state_key",
         }
     };
+
+    #[derive(Copy, Clone, Debug, Default, Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    pub enum Format {
+        #[default]
+        Content,
+        Event,
+    }
 
     /// Request type for the `get_state_events_for_key` endpoint.
     #[derive(Clone, Debug)]
@@ -37,12 +46,21 @@ pub mod v3 {
 
         /// The key of the state to look up.
         pub state_key: String,
+
+        /// The desired format of the returned event.
+        pub format: Format,
     }
 
     impl Request {
         /// Creates a new `Request` with the given room ID, event type and state key.
         pub fn new(room_id: OwnedRoomId, event_type: StateEventType, state_key: String) -> Self {
-            Self { room_id, event_type, state_key }
+            Self { room_id, event_type, state_key, format: Format::default() }
+        }
+
+        /// Set the `format` query parameter for this request.
+        pub fn with_format(mut self, format: Format) -> Self {
+            self.format = format;
+            self
         }
     }
 
@@ -110,36 +128,43 @@ pub mod v3 {
         const METADATA: Metadata = METADATA;
 
         fn try_from_http_request<B, S>(
-            _request: http::Request<B>,
+            request: http::Request<B>,
             path_args: &[S],
         ) -> Result<Self, ruma_common::api::error::FromHttpRequestError>
         where
             B: AsRef<[u8]>,
             S: AsRef<str>,
         {
+            #[derive(Deserialize)]
+            struct RequestQuery {
+                format: Format,
+            }
+
             // FIXME: find a way to make this if-else collapse with serde recognizing trailing
             // Option
             let (room_id, event_type, state_key): (OwnedRoomId, StateEventType, String) =
                 if path_args.len() == 3 {
-                    serde::Deserialize::deserialize(serde::de::value::SeqDeserializer::<
+                    Deserialize::deserialize(serde::de::value::SeqDeserializer::<
+                        _,
+                        serde::de::value::Error,
+                    >::new(
+                        path_args.iter().map(::std::convert::AsRef::as_ref)
+                    ))?
+                } else {
+                    let (a, b) = Deserialize::deserialize(serde::de::value::SeqDeserializer::<
                         _,
                         serde::de::value::Error,
                     >::new(
                         path_args.iter().map(::std::convert::AsRef::as_ref),
-                    ))?
-                } else {
-                    let (a, b) =
-                        serde::Deserialize::deserialize(serde::de::value::SeqDeserializer::<
-                            _,
-                            serde::de::value::Error,
-                        >::new(
-                            path_args.iter().map(::std::convert::AsRef::as_ref),
-                        ))?;
+                    ))?;
 
                     (a, b, "".into())
                 };
 
-            Ok(Self { room_id, event_type, state_key })
+            let query: RequestQuery =
+                serde_html_form::from_str(request.uri().query().unwrap_or(""))?;
+
+            Ok(Self { room_id, event_type, state_key, format: query.format })
         }
     }
 }
