@@ -247,8 +247,12 @@ fn reverse_topological_power_sort<E: Event>(
 
 /// Sorts the event graph based on number of outgoing/incoming edges.
 ///
-/// `key_fn` is used as to obtain the power level and age of an event for breaking ties (together
-/// with the event ID).
+/// # Arguments
+///
+/// * `graph`: a graph whose keys are state event IDs and values are the `auth_events` of the state
+///   event.
+/// * `key_fn`: used as to obtain the power level and age of an event for breaking ties (together
+///   with the event ID).
 pub fn lexicographical_topological_sort<Id, F>(
     graph: &HashMap<Id, HashSet<Id>>,
     key_fn: F,
