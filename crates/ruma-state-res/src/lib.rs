@@ -1,7 +1,7 @@
 use std::{
     borrow::Borrow,
-    cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BTreeSet, HashMap, HashSet},
     hash::Hash,
 };
 
@@ -261,81 +261,88 @@ where
     F: Fn(&EventId) -> Result<(Int, MilliSecondsSinceUnixEpoch)>,
     Id: Clone + Eq + Ord + Hash + Borrow<EventId>,
 {
-    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(PartialEq, Eq)]
     struct TieBreaker<'a, Id> {
-        inv_power_level: Int,
-        age: MilliSecondsSinceUnixEpoch,
+        power_level: Int,
+        origin_server_ts: MilliSecondsSinceUnixEpoch,
         event_id: &'a Id,
     }
 
-    info!("starting lexicographical topological sort");
-    // NOTE: an event that has no incoming edges happened most recently,
-    // and an event that has no outgoing edges happened least recently.
-
-    // NOTE: this is basically Kahn's algorithm except we look at nodes with no
-    // outgoing edges, c.f.
-    // https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm
-
-    // outdegree_map is an event referring to the events before it, the
-    // more outdegree's the more recent the event.
-    let mut outdegree_map = graph.clone();
-
-    // The number of events that depend on the given event (the EventId key)
-    // How many events reference this event in the DAG as a parent
-    let mut reverse_graph: HashMap<_, HashSet<_>> = HashMap::new();
-
-    // Vec of nodes that have zero out degree, least recent events.
-    let mut zero_outdegree = Vec::new();
-
-    for (node, edges) in graph {
-        if edges.is_empty() {
-            let (power_level, age) = key_fn(node.borrow())?;
-            // The `Reverse` is because rusts `BinaryHeap` sorts largest -> smallest we need
-            // smallest -> largest
-            zero_outdegree.push(Reverse(TieBreaker {
-                inv_power_level: -power_level,
-                age,
-                event_id: node,
-            }));
-        }
-
-        reverse_graph.entry(node).or_default();
-        for edge in edges {
-            reverse_graph.entry(edge).or_default().insert(node);
+    impl<'a, Id> Ord for TieBreaker<'a, Id>
+    where
+        Id: Ord,
+    {
+        fn cmp(&self, other: &Self) -> Ordering {
+            // NOTE: the first comparison is "backwards" intentionally, this is
+            // the ordering defined by the spec.
+            Ordering::Equal
+                .then(other.power_level.cmp(&self.power_level))
+                .then(self.origin_server_ts.cmp(&self.origin_server_ts))
+                .then(self.event_id.cmp(self.event_id))
         }
     }
 
-    let mut heap = BinaryHeap::from(zero_outdegree);
+    impl<'a, Id> PartialOrd for TieBreaker<'a, Id>
+    where
+        Id: Ord,
+    {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
 
-    // We remove the oldest node (most incoming edges) and check against all other
-    let mut sorted = vec![];
-    // Destructure the `Reverse` and take the smallest `node` each time
-    while let Some(Reverse(item)) = heap.pop() {
-        let node = item.event_id;
+    let mut in_degrees = HashMap::<_, usize>::new();
+    for (event_id, auth_events) in graph {
+        *in_degrees.entry(event_id).or_default() += auth_events.len();
+    }
 
-        for &parent in reverse_graph.get(node).expect("EventId in heap is also in reverse_graph") {
-            // The number of outgoing edges this node has
-            let out = outdegree_map
-                .get_mut(parent.borrow())
-                .expect("outdegree_map knows of all referenced EventIds");
+    let mut queue =
+        in_degrees.iter().filter_map(|(&k, &v)| (v == 0).then_some(k)).collect::<Vec<_>>();
 
-            // Only push on the heap once older events have been cleared
-            out.remove(node.borrow());
-            if out.is_empty() {
-                let (power_level, age) = key_fn(node.borrow())?;
-                heap.push(Reverse(TieBreaker {
-                    inv_power_level: -power_level,
-                    age,
-                    event_id: parent,
-                }));
+    let mut results = Vec::new();
+
+    while !queue.is_empty() {
+        // Add this layer of nodes to `results`
+        match &*queue {
+            // Nothing to do
+            [] => (),
+
+            // No ties to break
+            [x] => results.push(<Id as Clone>::clone(x)),
+
+            // Break ties
+            xs => {
+                let sorted = xs
+                    .iter()
+                    .map(|x| {
+                        let (power_level, origin_server_ts) = key_fn((*x).borrow())?;
+                        let x = TieBreaker { power_level, origin_server_ts, event_id: x };
+                        Ok(x)
+                    })
+                    .collect::<Result<BTreeSet<_>>>()?
+                    .into_iter()
+                    .map(|x| <Id as Clone>::clone(x.event_id));
+
+                results.extend(sorted);
             }
         }
 
-        // synapse yields we push then return the vec
-        sorted.push(node.clone());
+        // Compute the next layer of nodes
+        let mut new_queue = Vec::new();
+        for event_id in &queue {
+            for auth_event in &graph[(*event_id).borrow()] {
+                if let Some(x) = in_degrees.get_mut(auth_event) {
+                    *x -= 1;
+                    if *x == 0 {
+                        new_queue.push(auth_event);
+                    }
+                }
+            }
+        }
+        queue = new_queue;
     }
 
-    Ok(sorted)
+    Ok(results)
 }
 
 /// Find the power level for the sender of `event_id` or return a default value of zero.
